@@ -651,10 +651,14 @@
 	 });
    }
 
-   function normalizeFavoriteLine(lineValue) {
+	function normalizeLineKey(lineValue) {
 	 if (typeof lineValue !== "string") return "";
 	 return lineValue.trim().toUpperCase();
-   }
+	}
+
+	function normalizeFavoriteLine(lineValue) {
+	 return normalizeLineKey(lineValue);
+	}
 
    function getSanitizedFavoriteState(state) {
 	 const rawFavorites = Array.isArray(state.favoriteLines) ? state.favoriteLines : [];
@@ -1069,7 +1073,10 @@
 	     });
 
 	     // Le fichier JS contient la variable globale temporaire window.horairesChunk
-	     Object.assign(horairesData, window.horairesChunk);
+	     const loadedChunk = window.horairesChunk || {};
+	     const newTripIds = Object.keys(loadedChunk);
+	     Object.assign(horairesData, loadedChunk);
+	     indexScheduleDataIncremental(newTripIds);
 	     loadedRegions.add(key);
 
 	 } catch (err) {
@@ -1551,6 +1558,101 @@
        return output;
    }
 
+   function extractTripMeta(tripId, routeId) {
+	 const cacheKey = `${tripId || ""}#${routeId || ""}`;
+	 if (tripMetaCache[cacheKey]) {
+	     return tripMetaCache[cacheKey];
+	 }
+
+	 const tripParts = typeof tripId === "string" ? tripId.split("-") : [];
+	 const routeCandidates = [];
+	 if (routeId) routeCandidates.push(routeId);
+	 if (tripParts.length >= 2) routeCandidates.push(`${tripParts[0]}-${tripParts[1]}`);
+	 if (tripParts.length >= 1) routeCandidates.push(tripParts[0]);
+
+	 let matchedRouteId = null;
+	 let routeEntry = null;
+	 for (const candidate of routeCandidates) {
+	     if (routeData[candidate]) {
+		 matchedRouteId = candidate;
+		 routeEntry = routeData[candidate];
+		 break;
+	     }
+	 }
+
+	 const meta = {
+	     routeId: matchedRouteId || routeId || null,
+	     routeShortName: routeEntry ? routeEntry.rsn : "",
+	     routeLongName: routeEntry ? routeEntry.rln : ""
+	 };
+	 tripMetaCache[cacheKey] = meta;
+	 return meta;
+   }
+
+   function isValidStopCoord(stopId) {
+	 if (!stopId || !stopsData[stopId]) return false;
+	 const lat = stopsData[stopId].la;
+	 const lon = stopsData[stopId].lo;
+	 return Number.isFinite(lat) && Number.isFinite(lon);
+   }
+
+   function indexScheduleDataIncremental(newTripIds = []) {
+	 if (!Array.isArray(newTripIds) || newTripIds.length === 0) return;
+
+	 newTripIds.forEach(tripId => {
+	     if (!tripId || indexedTripIds.has(tripId)) return;
+
+	     const schedule = horairesData[tripId];
+	     if (!Array.isArray(schedule) || schedule.length === 0) {
+		 indexedTripIds.add(tripId);
+		 return;
+	     }
+
+	     const meta = extractTripMeta(tripId);
+	     const lineKey = normalizeLineKey(meta.routeShortName);
+
+	     if (lineKey) {
+		 if (!lineToTripIds[lineKey]) {
+		     lineToTripIds[lineKey] = [];
+		 }
+		 lineToTripIds[lineKey].push(tripId);
+	     }
+
+	     if (lineKey) {
+		 schedule.forEach((entry, index) => {
+		     const stopId = entry?.s;
+		     if (!stopId || !isValidStopCoord(stopId)) return;
+
+		     const seq = Number.isFinite(entry?.seq) ? entry.seq : index + 1;
+		     const time = typeof entry?.a === "string" ? entry.a : "";
+
+		     if (!stopToLineEntries[stopId]) {
+			 stopToLineEntries[stopId] = {};
+		     }
+		     if (!stopToLineEntries[stopId][lineKey]) {
+			 stopToLineEntries[stopId][lineKey] = [];
+		     }
+		     stopToLineEntries[stopId][lineKey].push({
+			 tripId,
+			 seq,
+			 a: time,
+			 routeId: meta.routeId
+		     });
+		 });
+	     }
+
+	     indexedTripIds.add(tripId);
+	 });
+   }
+
+   function getIndexStats() {
+	 return {
+	     tripCount: indexedTripIds.size,
+	     lineCount: Object.keys(lineToTripIds).length,
+	     stopCount: Object.keys(stopToLineEntries).length
+	 };
+   }
+
    function getRouteLongName(routeId) {
        route = routeData[routeId];
        return route ? route.rln : " "
@@ -1972,6 +2074,11 @@ ${alerts.length>0 ? '<a href="#" onclick="showAlertsInPanel(\''+routeIdForAlerts
      //Load theoretical schedule first (large file)
      let horairesData = {};
      let loadedRegions = new Set();
+	let lineToTripIds = {};
+	let stopToLineEntries = {};
+	let tripMetaCache = {};
+	let indexedTripIds = new Set();
+	let linePolylineCache = {};
      const currentDayType=getTodayType();
      loadScheduleFile_region("LG", currentDayType);
      
