@@ -1077,6 +1077,7 @@
 	     const newTripIds = Object.keys(loadedChunk);
 	     Object.assign(horairesData, loadedChunk);
 	     indexScheduleDataIncremental(newTripIds);
+	     renderFavoriteLineTraces();
 	     loadedRegions.add(key);
 
 	 } catch (err) {
@@ -1558,6 +1559,25 @@
        return output;
    }
 
+   function extractLineFromTripId(tripId) {
+	 if (typeof tripId !== "string" || !tripId) return "";
+
+	 // Common key pattern in stop_times chunks:
+	 // 51587752-L_PA_2026-26_LG_N3-Sem-N-3-05
+	 // 51587754-L_PA_2026-26_LG_N3-Sem-N-3-05-1101100
+	 const match = tripId.match(/_[A-Z]{1,5}_([A-Za-z0-9/'-]+)-(?:SEM|SAM|DIM|MER|Sem)/i);
+	 if (match && match[1]) return normalizeLineKey(match[1]);
+
+	 // Fallback for generic GTFS-like keys where line appears after an underscore.
+	 const tokens = tripId.split("_");
+	 if (tokens.length >= 2) {
+	     const candidate = tokens[tokens.length - 1].split("-")[0];
+	     return normalizeLineKey(candidate);
+	 }
+
+	 return "";
+   }
+
    function extractTripMeta(tripId, routeId) {
 	 const cacheKey = `${tripId || ""}#${routeId || ""}`;
 	 if (tripMetaCache[cacheKey]) {
@@ -1582,7 +1602,7 @@
 
 	 const meta = {
 	     routeId: matchedRouteId || routeId || null,
-	     routeShortName: routeEntry ? routeEntry.rsn : "",
+	     routeShortName: routeEntry ? routeEntry.rsn : extractLineFromTripId(tripId),
 	     routeLongName: routeEntry ? routeEntry.rln : ""
 	 };
 	 tripMetaCache[cacheKey] = meta;
@@ -1651,6 +1671,108 @@
 	     lineCount: Object.keys(lineToTripIds).length,
 	     stopCount: Object.keys(stopToLineEntries).length
 	 };
+   }
+
+   function getLineColor(lineKey) {
+	 const palette = [
+	     "#1b6ec2",
+	     "#e65100",
+	     "#00897b",
+	     "#8e24aa",
+	     "#2e7d32",
+	     "#c62828",
+	     "#3949ab",
+	     "#6d4c41",
+	     "#ad1457",
+	     "#1565c0"
+	 ];
+	 const input = normalizeLineKey(lineKey);
+	 if (!input) return palette[0];
+
+	 let hash = 0;
+	 for (let i = 0; i < input.length; i++) {
+	     hash = ((hash << 5) - hash) + input.charCodeAt(i);
+	     hash |= 0;
+	 }
+	 return palette[Math.abs(hash) % palette.length];
+   }
+
+   function getLineTraceLatLngs(lineKey, maxVariants = 3) {
+	 const normalizedLine = normalizeLineKey(lineKey);
+	 if (!normalizedLine) return [];
+
+	 const indexedTrips = lineToTripIds[normalizedLine] || [];
+	 const realtimeTrips = Object.keys(tripLineByTripId).filter(tripId => tripLineByTripId[tripId] === normalizedLine);
+	 const tripIds = [...new Set([...indexedTrips, ...realtimeTrips])];
+	 if (tripIds.length === 0) return [];
+
+	 const signature = tripIds.slice().sort().join("|");
+	 const cached = linePolylineCache[normalizedLine];
+	 if (cached && cached.signature === signature) {
+	     return cached.polylines;
+	 }
+
+	 const polylines = [];
+	 const seenKeys = new Set();
+	 for (const tripId of tripIds) {
+	     const schedule = horairesData[tripId];
+	     if (!Array.isArray(schedule) || schedule.length < 2) continue;
+
+	     const stopSequenceKey = schedule.map(entry => entry?.s || "").filter(Boolean).join(">");
+	     if (!stopSequenceKey || seenKeys.has(stopSequenceKey)) continue;
+	     seenKeys.add(stopSequenceKey);
+
+	     const latLngs = [];
+	     let previousPair = "";
+	     schedule.forEach(entry => {
+		 const stopId = entry?.s;
+		 if (!isValidStopCoord(stopId)) return;
+		 const latLng = getStopLatLng(stopId, stopsData);
+		 if (!latLng) return;
+		 const pair = `${latLng[0]},${latLng[1]}`;
+		 if (pair === previousPair) return;
+		 previousPair = pair;
+		 latLngs.push(latLng);
+	     });
+
+	     if (latLngs.length >= 2) {
+		 polylines.push(latLngs);
+	     }
+
+	     if (polylines.length >= maxVariants) break;
+	 }
+
+	 linePolylineCache[normalizedLine] = {
+	     signature,
+	     polylines
+	 };
+
+	 return polylines;
+   }
+
+   function renderFavoriteLineTraces() {
+	 if (typeof map === "undefined" || !favoriteLineLayer) return;
+
+	 favoriteLineLayer.clearLayers();
+	 const { activeFavoriteLines } = getSanitizedFavoriteState(appState);
+	 if (!Array.isArray(activeFavoriteLines) || activeFavoriteLines.length === 0) return;
+
+	 activeFavoriteLines.forEach(line => {
+	     const normalizedLine = normalizeLineKey(line);
+	     if (!normalizedLine) return;
+	     const lineColor = getLineColor(normalizedLine);
+	     const traceVariants = getLineTraceLatLngs(normalizedLine, 3);
+
+	     traceVariants.forEach(latLngs => {
+		 L.polyline(latLngs, {
+		     color: lineColor,
+		     weight: 5,
+		     opacity: 0.7,
+		     lineCap: "round",
+		     lineJoin: "round"
+		 }).addTo(favoriteLineLayer);
+	     });
+	 });
    }
 
    function getRouteLongName(routeId) {
@@ -1971,6 +2093,8 @@
 	   }
 	   first=0;
 
+	   renderFavoriteLineTraces();
+
 	   // Loop in real-time formatted vehicle data
 	   //formattedVehicleData.vehicles.forEach(bus => {
 	   formattedVehicleData.data.forEach(bus => {
@@ -1980,6 +2104,9 @@
 	       //late client-side set of sn & ln, TO DO: could be set in server side
 	       trip.route_short_name = getRouteShortName(trip.routeId) || null;
 	       trip.route_long_name= getRouteLongName(trip.routeId) || null;
+	       if (trip.tripId && trip.route_short_name) {
+		   tripLineByTripId[trip.tripId] = normalizeLineKey(trip.route_short_name.toString());
+	       }
 		     
 	       // If an active filter exists (manual or favorites), skip non-matching lines
 	       if (hasActiveFilter && !(trip.route_short_name.toString().toUpperCase() in filterLineStops)) return;
@@ -2079,6 +2206,8 @@ ${alerts.length>0 ? '<a href="#" onclick="showAlertsInPanel(\''+routeIdForAlerts
 	let tripMetaCache = {};
 	let indexedTripIds = new Set();
 	let linePolylineCache = {};
+	let tripLineByTripId = {};
+	let favoriteLineLayer = null;
      const currentDayType=getTodayType();
      loadScheduleFile_region("LG", currentDayType);
      
@@ -2165,6 +2294,8 @@ ${alerts.length>0 ? '<a href="#" onclick="showAlertsInPanel(\''+routeIdForAlerts
 	   layers: [selectedBaseMapLayer],
 	   zoomControl: !isMobileLayout
    });
+
+	favoriteLineLayer = L.layerGroup().addTo(map);
 
    populateBaseMapSelect(baseMaps, selectedBaseMapLabel);
    applySavedUiState();
